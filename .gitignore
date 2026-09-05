@@ -1,0 +1,36 @@
+# --- DeHashed query tool: ignore all generated data & secrets ---
+
+# Secrets / credentials
+.env
+*.env
+!.env.example
+
+# Generated output (per-domain dirs live under output/ by default)
+output/
+allData.json
+data-wells.json
+*.lst
+
+# Legacy: earlier versions wrote per-domain dirs in the repo root
+*.com/
+*.io/
+*.org/
+*.net/
+
+# Python
+__pycache__/
+*.py[cod]
+*.egg-info/
+.venv/
+venv/
+env/
+.pytest_cache/
+.mypy_cache/
+
+# Editor / OS
+.idea/
+.vscode/
+.DS_Store
+
+# AI assistant guidance — local only, never commit
+CLAUDE.md
