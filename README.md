@@ -1,225 +1,195 @@
-# DeHashed v2 Query Tool
+# BreachQuery
 
-`dehashquery.py` queries the [DeHashed API v2](https://app.dehashed.com/documentation/api)
-to dump and parse breach data (emails, usernames, passwords, and password hashes)
-for one or more domains, with optional breach-metadata enrichment.
+BreachQuery provides two Python command-line tools for querying authorized
+credential-exposure data from [DeHashed](https://www.dehashed.com/) and
+[HackNotice](https://hacknotice.com/). Both tools normalize results into the same
+set of files, making provider output easier to review, compare, or merge.
 
-> **Note:** The legacy v1 API is fully deprecated. You must use a v2 API key — if
-> you generated yours before the v2 migration, refresh it once from your
-> [DeHashed profile](https://app.dehashed.com/profile).
+Use these tools only with accounts, domains, and data you are authorized to
+access. Generated files can contain sensitive information and should be handled
+accordingly.
 
-## Features
+## Tools
 
-- **Correct, current v2 schema** — emits every field the API returns today
-  (email, username, password, hashed_password, name, dob, license_plate, address,
-  phone, company, url, social, cryptocurrency_address, database_name).
-- **Full pagination** — automatically pages through results up to the API's
-  50,000-per-query cap (deep pages fetched sequentially, as the API requires).
-- **Rate-limit aware** — client-side throttle (default 15 req/s, under the 20 req/s
-  limit) plus automatic retry/back-off on `429`/`5xx`.
-- **Credit-safe** — checks search access and credit balance *before* querying, and
-  prompts for confirmation (skippable with `-y`). Cached results are reused so you
-  never pay twice for the same domain.
-- **Per-run query budget** — defaults to at most 100 billed search requests across
-  all domains; change it with `--max-queries` or remove the local cap with `--infinite`.
-- **Secret-safe key handling** — the key is read from `.env` or an environment
-  variable, never required on the command line.
-- **Multi-domain** — pass a single `--domain` or a `--domains` file.
-- **Breach enrichment** (`--full`) — joins each record against DeHashed's free
-  `data-wells` feed to add breach date, record count, sensitivity, and description.
-- **Free password check** — SHA-256 password-appearance lookup that costs no credits.
+| Tool | Provider | Default scope | Built-in safeguards |
+| --- | --- | --- | --- |
+| `dehashquery.py` | DeHashed API v2 | Domain search across available breach data | Credit preflight, confirmation prompt, 100-query budget, caching, and rate limiting |
+| `hacknoticequery.py` | HackNotice Research API | Credential hits from the last 90 days | Count-before-fetch, confirmation prompt, 10-page cap, 300-query budget, caching, and request throttling |
 
-## Install
+The DeHashed tool also supports raw queries, breach-metadata enrichment, credit
+checks, and a free password-appearance check. The HackNotice tool supports a
+no-cost credential check before any research query is made.
+
+## Requirements
+
+- Python 3.9 or newer
+- A DeHashed v2 API key, HackNotice API access, or both
+- HackNotice Research access must already be approved for your account
+
+Install the dependency in a virtual environment:
 
 ```sh
-pip install -r requirements.txt
-cp .env.example .env      # then edit .env and paste your API key
+python3 -m venv .venv
+. .venv/bin/activate
+python3 -m pip install -r requirements.txt
+cp .env.example .env
 ```
 
-## API key
+Add only the credentials for the provider you plan to use. The tools check the
+process environment first, then `.env` in the current directory or beside the
+scripts.
 
-Resolved from the `DEHASHED_API_KEY` environment variable, then a `.env` file
-(`DEHASHED_API_KEY=...`) in the current directory or next to the script. API keys
-are not accepted on the command line, where they can leak through process listings
-or shell history.
+| Provider | Credentials |
+| --- | --- |
+| DeHashed | `DEHASHED_API_KEY` |
+| HackNotice, preferred | `HACKNOTICE_INTEGRATION_KEY` |
+| HackNotice, existing session | `HACKNOTICE_API_KEY` and `HACKNOTICE_JWT_TOKEN` |
+| HackNotice, automatic sign-in | `HACKNOTICE_API_KEY`, `HACKNOTICE_EMAIL`, and `HACKNOTICE_PASSWORD` |
 
-`.env` is git-ignored.
+Credentials are never accepted as command-line arguments, where they could be
+exposed through shell history or process listings. `.env` and generated output
+are excluded from Git.
 
-## Usage
-
-```text
-dehashquery.py [-v] [--no-color] {dump,password-check,credits} ...
-```
-
-### Dump a domain
+## Quick start
 
 ```sh
-# `dump` is the default subcommand, so this also works: dehashquery.py -d example.com
+# Check DeHashed access and balances without running a search
+python3 dehashquery.py credits
+
+# Query one domain with DeHashed
 python3 dehashquery.py dump -d example.com
-python3 dehashquery.py dump --domains domains.txt --full -y
+
+# Verify HackNotice credentials without using the research API
+python3 hacknoticequery.py verify
+
+# Count recent HackNotice hits without fetching records
+python3 hacknoticequery.py count -d example.com
+
+# Count, confirm, and fetch recent HackNotice hits
+python3 hacknoticequery.py dump -d example.com
 ```
+
+## DeHashed usage
+
+`dehashquery.py` uses the current [DeHashed API v2](https://app.dehashed.com/documentation/api).
+Legacy v1 keys are not supported; refresh an older key from your
+[DeHashed profile](https://app.dehashed.com/profile) before use.
+
+```sh
+# `dump` is the default subcommand, so `-d example.com` also works
+python3 dehashquery.py dump -d example.com
+
+# Query several newline-separated domains and enrich the CSV with breach metadata
+python3 dehashquery.py dump --domains domains.txt --full -y
+
+# Check a password without spending search credits
+python3 dehashquery.py password-check
+
+# Show search and WHOIS credit balances
+python3 dehashquery.py credits
+```
+
+The password check reads from a hidden prompt, hashes the value locally with
+SHA-256, and never sends the plaintext password.
 
 Key `dump` options:
 
 | Option | Description |
 | --- | --- |
-| `-d, --domain` | Single domain to query |
-| `--domains` | File with newline-separated domains |
-| `-q, --query` | Raw DeHashed query (overrides `domain:<domain>`) |
-| `-s, --size` | Results per page, 1–10000 (default 10000) |
-| `-o, --output-dir` | Base output directory (default `output/dehashed/`) |
-| `--max-queries` | Maximum billed search requests for the run (default 100) |
-| `--infinite` | Remove the local query cap; DeHashed limits and credit balance still apply |
-| `--full` | Add breach-metadata columns to the CSV (free) |
-| `--refresh` | Ignore cached results and re-query |
-| `-y, --yes` | Skip the credit-confirmation prompt |
+| `-d, --domain` | Query one domain |
+| `--domains` | Read newline-separated domains from a file |
+| `-q, --query` | Use a raw DeHashed query instead of `domain:<domain>` |
+| `-s, --size` | Set results per page from 1 to 10,000 (default: 10,000) |
+| `--no-dedupe` | Keep raw entries instead of deduplicating them locally |
+| `--rate` | Set requests per second (default: 15; API limit: 20) |
+| `--max-queries` | Set the run's billed-search limit (default: 100) |
+| `--infinite` | Remove the local query budget; provider limits still apply |
+| `--full` | Add free data-wells breach metadata to `outData.csv` |
+| `-o, --output-dir` | Change the base directory (default: `output/dehashed/`) |
+| `--refresh` | Ignore cached results and query again |
+| `-y, --yes` | Skip the credit-use confirmation prompt |
 
-### Check a password (free, no credits)
+Each search request uses one DeHashed credit. Before a new search, the tool checks
+search access and the available balance. Results are cached by domain so repeated
+runs do not spend credits unless `--refresh` is supplied. DeHashed returns at most
+50,000 results per query; larger result sets are truncated with a warning.
+
+## HackNotice usage
+
+`hacknoticequery.py` queries the HackNotice `research8` phrase-search API. It is
+for approved HackNotice accounts and does not provide or bypass API access.
 
 ```sh
-python3 dehashquery.py password-check
+# Authentication and connectivity only; no research query
+python3 hacknoticequery.py verify
+
+# Count hits in the default 90-day window
+python3 hacknoticequery.py count -d example.com
+
+# Fetch up to 10 pages after showing the count and asking for confirmation
+python3 hacknoticequery.py dump -d example.com
+
+# Search a 30-day window, raise the page cap, and skip confirmation
+python3 hacknoticequery.py dump -d example.com --days 30 --max-pages 20 -y
+
+# Process several newline-separated domains
+python3 hacknoticequery.py dump --domains domains.txt
 ```
 
-The password is read from a hidden prompt, SHA-256 hashed locally, and never sent
-in plaintext.
+Key query options:
 
-### Show credit balances
+| Option | Description |
+| --- | --- |
+| `-d, --domain` | Query one domain |
+| `--domains` | Read newline-separated domains from a file |
+| `--days` | Set the look-back window (default: 90) |
+| `--searchtype` | Use `wildcard_pre` (default), `wildcard_both`, `wildcard_post`, or `match_phrase` |
+| `--max-pages` | Set pages fetched per domain (default: 10 at 50 rows per page; `dump` only) |
+| `--max-queries` | Set the run's count/page request budget (default: 300) |
+| `--infinite` | Remove the query budget; the page cap and provider limits still apply |
+| `--min-interval` | Set seconds between requests (default: 1.1; minimum: 1) |
+| `-o, --output-dir` | Change the base directory (default: `output/hacknotice/`; `dump` only) |
+| `--refresh` | Ignore cached results and query again (`dump` only) |
+| `-y, --yes` | Skip the fetch confirmation prompt (`dump` only) |
 
-```sh
-python3 dehashquery.py credits
-```
+`verify` calls HackNotice's credential-test endpoint and does not touch the
+research API. A `count` request fetches no records, but HackNotice does not publish
+whether count or page requests are billed. The local budget therefore counts both
+as research queries. Confirm the billing terms for your account before raising or
+removing the limit.
+
+When an existing JWT is supplied, the tool sends the API key and token on each
+request but does not sign out that session. Replace the token after it expires.
+Sessions created by the automatic sign-in flow are signed out when the command
+finishes.
 
 ## Output
 
-Written to `output/dehashed/<domain>/`:
+Results are written under `output/dehashed/<domain>/` or
+`output/hacknotice/<domain>/`:
 
 | File | Contents |
 | --- | --- |
 | `emails.txt` | Unique email addresses |
-| `users.lst` | Unique emails + usernames (spraying candidates) |
+| `users.lst` | Unique email addresses and usernames |
 | `passwords.lst` | Unique plaintext passwords |
-| `emailAndPassword.txt` | `email:password` pairs |
-| `emailAndHash.txt` | `email:hash` pairs |
-| `outData.csv` | Full per-record table (+ breach metadata with `--full`) |
-| `allData.json` | Cached raw API response for the domain |
+| `emailAndPassword.txt` | Unique `email:password` pairs |
+| `emailAndHash.txt` | Unique `email:hash` pairs |
+| `outData.csv` | Normalized records; DeHashed can add breach metadata with `--full` |
+| `allData.json` | Provider-specific raw-data cache and query metadata |
 
-All generated output and `.env` are git-ignored.
+Separate provider directories prevent one tool from reading or overwriting the
+other tool's cache. Treat the entire output directory as sensitive. Do not commit,
+email, or upload it to an untrusted system.
 
-## Notes & limits
-
-- 1 search = 1 credit. Cached domains are not re-queried unless you pass `--refresh`.
-- The 100-query default is a local safety budget, not an allocation of credits.
-  `--infinite` disables only this local budget.
-- The API returns at most 50,000 results per query; larger result sets are truncated
-  (a warning is printed).
-- WHOIS and monitoring endpoints exist in the v2 API but are out of scope for this tool.
-
----
-
-# HackNotice Research Query Tool
-
-`hacknoticequery.py` is a conservative companion to `dehashquery.py`. It queries
-the [HackNotice](https://hacknotice.com/) Research API (`research8` phrase search)
-for credential exposures on a domain and writes the **same output files** as the
-DeHashed tool, but limited to a recent window (default: the last 90 days).
-
-> **Access:** the HackNotice API is for approved accounts only and requires a
-> prior consultation with HackNotice. This tool cannot get you access — it only
-> uses credentials you already have.
-
-## Conservative by design
-
-- **Count first.** A count query runs before anything is fetched, and you confirm
-  the estimated page count before spending on record pages (skip with `-y`).
-- **Hard page cap.** `--max-pages` bounds retrieval per domain (default 10 pages,
-  50 rows/page). Larger result sets are truncated to the most recent rows.
-- **Per-run query budget.** At most 300 research count/page requests are made by
-  default across all domains. Use `--max-queries` to change the cap or `--infinite`
-  to remove it.
-- **Recent window only.** Defaults to the last 90 days (`--days`); results are
-  ordered newest-first so a page cap keeps the most recent exposures.
-- **Rate-limit safe.** Requests are throttled below HackNotice's documented
-  1 request/second governor (`--min-interval`).
-- **Cached.** A domain is not re-queried unless you pass `--refresh`.
-
-> **Billing:** HackNotice does not publish per-request billing for count and page
-> queries. The local budget conservatively counts each research count or page
-> request as one unit. Confirm how they are metered on your contract before raising
-> the cap.
-
-## Testing access without spending credits
-
-`hacknoticequery.py verify` authenticates and calls HackNotice's own credential-test
-endpoint (`POST /auth/verify`). It never touches the research/search surface, so it
-consumes no search credits — use it to confirm a key, a sign-in, or connectivity
-before running any real query:
+## Tests
 
 ```sh
-python3 hacknoticequery.py verify                 # uses .env / environment creds
+python3 -m unittest discover -s tests -v
+python3 dehashquery.py --help
+python3 hacknoticequery.py --help
 ```
 
-If you use HackNotice's MCP server instead, its `hacknotice_verify_credentials`
-tool serves the same purpose. (The `count` subcommand returns totals without
-fetching records, but whether *count* queries are metered is not published — treat
-`verify` as the guaranteed no-cost check.)
+## License
 
-## Credentials
-
-Resolved from environment variables, then a `.env` file:
-
-1. `HACKNOTICE_INTEGRATION_KEY` (preferred; a single `X-HackNotice-Integration-Key` header), **or**
-2. `HACKNOTICE_API_KEY` + `HACKNOTICE_JWT_TOKEN` (uses your existing session), **or**
-3. `HACKNOTICE_API_KEY` + `HACKNOTICE_EMAIL` + `HACKNOTICE_PASSWORD` (automatic JWT sign-in).
-
-With an existing session, the script sends `apikey: <key>` and
-`Authorization: JWT <token>` on every request. Email and password are only needed
-for the optional automatic sign-in flow. A supplied JWT is never signed out by the
-script; replace it when the HackNotice session expires.
-
-`.env` is git-ignored. See `.env.example`.
-Credentials are not accepted on the command line, where they can leak through
-process listings or shell history.
-
-## Usage
-
-```sh
-# Verify credentials + connectivity — spends no search credits
-python3 hacknoticequery.py verify
-
-# Count only — fetches no records
-python3 hacknoticequery.py count -d example.com
-
-# Dump last 90 days (count, confirm, then fetch — capped at 10 pages)
-python3 hacknoticequery.py dump -d example.com
-
-# Wider window, higher cap, no prompt
-python3 hacknoticequery.py dump -d example.com --days 30 --max-pages 20 -y
-
-# Remove the local 300-query budget (service limits still apply)
-python3 hacknoticequery.py dump -d example.com --infinite
-```
-
-Key `dump` options:
-
-| Option | Description |
-| --- | --- |
-| `-d, --domain` | Single domain to query |
-| `--domains` | File with newline-separated domains |
-| `--days` | Look-back window in days (default 90) |
-| `--searchtype` | Phrase match: `wildcard_pre` (default), `wildcard_both`, `wildcard_post`, `match_phrase` |
-| `--max-pages` | Max pages fetched per domain (default 10, 50 rows/page) |
-| `--max-queries` | Max research count/page requests for the run (default 300) |
-| `--infinite` | Remove the local query cap; HackNotice limits still apply |
-| `--min-interval` | Min seconds between requests (default 1.1) |
-| `-o, --output-dir` | Base output directory (default `output/hacknotice/`) |
-| `--refresh` | Ignore cache and re-query |
-| `-y, --yes` | Skip the confirmation prompt |
-
-## Output
-
-Identical layout to `dehashquery.py` (written to `output/hacknotice/<domain>/`): `emails.txt`,
-`users.lst`, `passwords.lst`, `emailAndPassword.txt`, `emailAndHash.txt`,
-`outData.csv`, and a cached `allData.json`. HackNotice records are mapped onto the
-same entry schema, so both tools' outputs can be diffed or merged directly. The
-separate default directory prevents either provider from consuming or overwriting
-the other provider's cache and reports.
+[MIT](LICENSE)
