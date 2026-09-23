@@ -22,7 +22,8 @@ requests are metered on your contract before raising the caps.
 
 Credentials resolve from environment variables, then a .env file.
   HACKNOTICE_INTEGRATION_KEY                        (preferred, single header)
-  HACKNOTICE_API_KEY + HACKNOTICE_EMAIL + HACKNOTICE_PASSWORD  (JWT sign-in)
+  HACKNOTICE_API_KEY + HACKNOTICE_JWT_TOKEN          (existing session)
+  HACKNOTICE_API_KEY + HACKNOTICE_EMAIL + HACKNOTICE_PASSWORD  (automatic sign-in)
 """
 
 from __future__ import annotations
@@ -98,18 +99,34 @@ def resolve_credentials() -> Dict[str, str]:
         value = os.environ.get(env_name) or dotenv.get(env_name)
         if value:
             creds[field] = value.strip()
-    account_secret = os.environ.get("HACKNOTICE_PASSWORD") or dotenv.get("HACKNOTICE_PASSWORD")
+    jwt_token = (
+        os.environ.get("HACKNOTICE_JWT_TOKEN")
+        or dotenv.get("HACKNOTICE_JWT_TOKEN")
+    )
+    if jwt_token:
+        creds["jwt_token"] = jwt_token.strip()
+    account_secret = (
+        os.environ.get("HACKNOTICE_PASSWORD")
+        or dotenv.get("HACKNOTICE_PASSWORD")
+    )
     if account_secret:
         creds["account_secret"] = account_secret.strip()
 
     if creds.get("integration_key"):
         return {"integration_key": creds["integration_key"]}
+    if all(creds.get(k) for k in ("api_key", "jwt_token")):
+        return {"api_key": creds["api_key"], "jwt_token": creds["jwt_token"]}
     if all(creds.get(k) for k in ("api_key", "email", "account_secret")):
-        return creds
+        return {
+            "api_key": creds["api_key"],
+            "email": creds["email"],
+            "account_secret": creds["account_secret"],
+        }
     raise SystemExit(
         f"{Colors.RED}[-] No HackNotice credentials found.{Colors.NOCOLOR} Set "
-        "HACKNOTICE_INTEGRATION_KEY, or HACKNOTICE_API_KEY + HACKNOTICE_EMAIL + "
-        "HACKNOTICE_PASSWORD, in the environment or a .env file."
+        "HACKNOTICE_INTEGRATION_KEY; HACKNOTICE_API_KEY + HACKNOTICE_JWT_TOKEN; "
+        "or HACKNOTICE_API_KEY + HACKNOTICE_EMAIL + HACKNOTICE_PASSWORD in the "
+        "environment or a .env file."
     )
 
 
@@ -182,6 +199,16 @@ class HackNoticeClient:
 
         if "integration_key" in creds:
             self.session.headers["X-HackNotice-Integration-Key"] = creds["integration_key"]
+        elif "jwt_token" in creds:
+            token = creds["jwt_token"].strip()
+            if token.upper().startswith("JWT "):
+                token = token[4:].strip()
+            if not token:
+                raise RuntimeError("HackNotice JWT token is empty.")
+            self.session.headers.update({
+                "apikey": creds["api_key"],
+                "Authorization": f"JWT {token}",
+            })
         else:
             self._sign_in(creds["api_key"], creds["email"], creds["account_secret"])
 
@@ -410,7 +437,12 @@ def load_cached_entries(cache: Path, domain: str,
 def cmd_verify(args: argparse.Namespace) -> int:
     """Check that credentials work and the API is reachable — no credits spent."""
     creds = resolve_credentials()
-    mode = "integration key" if "integration_key" in creds else "API key + sign-in"
+    if "integration_key" in creds:
+        mode = "integration key"
+    elif "jwt_token" in creds:
+        mode = "API key + existing JWT"
+    else:
+        mode = "API key + sign-in"
     client = HackNoticeClient(creds, min_interval=args.min_interval)
     try:
         client.verify()

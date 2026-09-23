@@ -168,7 +168,13 @@ fetching records, but whether *count* queries are metered is not published — t
 Resolved from environment variables, then a `.env` file:
 
 1. `HACKNOTICE_INTEGRATION_KEY` (preferred; a single `X-HackNotice-Integration-Key` header), **or**
-2. `HACKNOTICE_API_KEY` + `HACKNOTICE_EMAIL` + `HACKNOTICE_PASSWORD` (JWT sign-in).
+2. `HACKNOTICE_API_KEY` + `HACKNOTICE_JWT_TOKEN` (uses your existing session), **or**
+3. `HACKNOTICE_API_KEY` + `HACKNOTICE_EMAIL` + `HACKNOTICE_PASSWORD` (automatic JWT sign-in).
+
+With an existing session, the script sends `apikey: <key>` and
+`Authorization: JWT <token>` on every request. Email and password are only needed
+for the optional automatic sign-in flow. A supplied JWT is never signed out by the
+script; replace it when the HackNotice session expires.
 
 `.env` is git-ignored. See `.env.example`.
 Credentials are not accepted on the command line, where they can leak through

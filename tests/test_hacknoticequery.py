@@ -27,6 +27,20 @@ class CredentialTests(unittest.TestCase):
                 {"integration_key": "integration-key"},
             )
 
+    @patch("hacknoticequery.Path.is_file", return_value=False)
+    def test_existing_jwt_is_preferred_over_password_sign_in(self, _is_file: Mock) -> None:
+        values = {
+            "HACKNOTICE_API_KEY": " api-key ",
+            "HACKNOTICE_JWT_TOKEN": " jwt-token ",
+            "HACKNOTICE_EMAIL": "user@example.com",
+            "HACKNOTICE_PASSWORD": "password",
+        }
+        with patch.dict(os.environ, values, clear=True):
+            self.assertEqual(
+                hacknoticequery.resolve_credentials(),
+                {"api_key": "api-key", "jwt_token": "jwt-token"},
+            )
+
     def test_parser_rejects_secret_arguments(self) -> None:
         with redirect_stderr(io.StringIO()), self.assertRaises(SystemExit):
             hacknoticequery.build_parser().parse_args(
@@ -58,6 +72,23 @@ class ClientTests(unittest.TestCase):
         )
         retry = session.mount.call_args.args[1].max_retries
         self.assertEqual(retry.allowed_methods, frozenset({"GET"}))
+
+    @patch("hacknoticequery.requests.Session")
+    def test_existing_jwt_sets_headers_without_sign_in(self, session_type: Mock) -> None:
+        session = session_type.return_value
+        session.headers = {}
+
+        client = hacknoticequery.HackNoticeClient(
+            {"api_key": "api-key", "jwt_token": "JWT jwt-token"},
+            min_interval=1.0,
+        )
+
+        self.assertEqual(session.headers["apikey"], "api-key")
+        self.assertEqual(session.headers["Authorization"], "JWT jwt-token")
+        self.assertFalse(client._signed_in)
+        session.request.assert_not_called()
+        client.sign_out()
+        session.request.assert_not_called()
 
     @patch("hacknoticequery.time.sleep")
     @patch("hacknoticequery.requests.Session")
