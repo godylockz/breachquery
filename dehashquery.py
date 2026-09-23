@@ -52,6 +52,8 @@ DATA_WELLS_URL = "https://api.dehashed.com/data-wells"
 MAX_SIZE = 10_000          # API hard cap for `size`
 MAX_TOTAL = 50_000         # API hard cap for page*size (total results per query)
 DEFAULT_RATE = 15          # client-side requests/second (API limit is 20/s)
+DEFAULT_MAX_QUERIES = 100  # billed search requests per invocation
+DEFAULT_OUTPUT_DIR = "output/dehashed"
 REQUEST_TIMEOUT = 60       # seconds
 DEHASHED_CACHE_SOURCE = "dehashed-v2"
 
@@ -163,11 +165,46 @@ class ApiError(RuntimeError):
         )
 
 
+class QueryLimitReached(RuntimeError):
+    """Raised before a query would exceed the configured local budget."""
+
+
+class QueryBudget:
+    """Hard per-invocation limit for potentially billable query requests."""
+
+    def __init__(self, limit: Optional[int]) -> None:
+        if limit is not None and limit < 1:
+            raise ValueError("query limit must be at least 1")
+        self.limit = limit
+        self.used = 0
+
+    @property
+    def remaining(self) -> Optional[int]:
+        if self.limit is None:
+            return None
+        return self.limit - self.used
+
+    def consume(self) -> None:
+        remaining = self.remaining
+        if remaining is not None and remaining <= 0:
+            raise QueryLimitReached(
+                f"Local query limit of {self.limit} reached; rerun with "
+                "--max-queries or --infinite to continue."
+            )
+        self.used += 1
+
+    def summary(self) -> str:
+        limit = "unlimited" if self.limit is None else str(self.limit)
+        return f"{self.used}/{limit}"
+
+
 class DehashedClient:
     """Thin, resilient wrapper over the DeHashed v2 REST API."""
 
-    def __init__(self, api_key: str, rate: int = DEFAULT_RATE) -> None:
+    def __init__(self, api_key: str, rate: int = DEFAULT_RATE,
+                 query_limit: Optional[int] = None) -> None:
         self.limiter = RateLimiter(rate)
+        self.query_budget = QueryBudget(query_limit)
         self.session = requests.Session()
         self.session.headers.update({
             "Content-Type": "application/json",
@@ -181,7 +218,8 @@ class DehashedClient:
             read=3,
             backoff_factor=1.5,
             status_forcelist=(429, 500, 502, 503, 504),
-            allowed_methods=frozenset({"GET", "POST"}),
+            # Search POSTs may consume credits, so never retry them invisibly.
+            allowed_methods=frozenset({"GET"}),
             respect_retry_after_header=True,
             raise_on_status=False,
         )
@@ -212,6 +250,7 @@ class DehashedClient:
     def search(self, query: str, page: int, size: int,
                regex: bool = False, wildcard: bool = False,
                de_dupe: bool = False) -> Dict[str, Any]:
+        self.query_budget.consume()
         payload = {
             "query": query, "page": page, "size": size,
             "regex": regex, "wildcard": wildcard, "de_dupe": de_dupe,
@@ -289,8 +328,20 @@ def fetch_all_entries(client: DehashedClient, query: str, size: int,
         log.warning("total=%d exceeds the API cap of %d; results will be truncated.",
                     total, MAX_TOTAL)
 
-    last_page = min(reachable // size + (1 if reachable % size else 0), MAX_TOTAL // size)
-    log.info("total=%d  fetching up to %d page(s) at size=%d", total, max(last_page, 1), size)
+    requested_last_page = min(
+        reachable // size + (1 if reachable % size else 0),
+        MAX_TOTAL // size,
+    )
+    last_page = max(requested_last_page, 1)
+    remaining = client.query_budget.remaining
+    if remaining is not None and last_page - 1 > remaining:
+        last_page = 1 + remaining
+        log.warning(
+            "Local query limit truncates this result to %d page(s); use "
+            "--max-queries or --infinite to continue.",
+            last_page,
+        )
+    log.info("total=%d  fetching up to %d page(s) at size=%d", total, last_page, size)
 
     # Deep pagination beyond 10k must be sequential; a simple ascending loop
     # satisfies that. The server is the source of truth for the real depth cap:
@@ -580,7 +631,8 @@ def cmd_dump(args: argparse.Namespace) -> int:
         raise SystemExit(f"{Colors.RED}[-] No valid domains supplied.{Colors.NOCOLOR}")
 
     api_key = resolve_api_key()
-    client = DehashedClient(api_key, rate=args.rate)
+    query_limit = None if args.infinite else args.max_queries
+    client = DehashedClient(api_key, rate=args.rate, query_limit=query_limit)
     base_dir = Path(args.output_dir)
 
     wells: Optional[Dict[str, Dict[str, Any]]] = None
@@ -601,6 +653,12 @@ def cmd_dump(args: argparse.Namespace) -> int:
             print(f"{Colors.CYAN}[*] Using cached data ({cache}). Use --refresh to re-query.{Colors.NOCOLOR}")
             data = load_cached_data(cache)
         else:
+            if client.query_budget.remaining == 0:
+                print(
+                    f"{Colors.YELLOW}[!] Local query limit reached; skipping "
+                    f"uncached target {domain}.{Colors.NOCOLOR}"
+                )
+                continue
             query = args.query or f"domain:{domain}"
             data = fetch_all_entries(client, query, size=args.size,
                                      de_dupe=not args.no_dedupe)
@@ -614,6 +672,8 @@ def cmd_dump(args: argparse.Namespace) -> int:
         if isinstance(data, dict) and data.get("balance") is not None:
             print(f"{Colors.CYAN}[*] Remaining balance: {data['balance']}{Colors.NOCOLOR}")
 
+    print(f"{Colors.CYAN}[*] Search queries used: "
+          f"{client.query_budget.summary()}{Colors.NOCOLOR}")
     print(f"{Colors.GREEN}[*] Done{Colors.NOCOLOR}")
     return 0
 
@@ -645,6 +705,16 @@ def cmd_credits(args: argparse.Namespace) -> int:
 # --------------------------------------------------------------------------- #
 # CLI
 # --------------------------------------------------------------------------- #
+def positive_int(value: str) -> int:
+    try:
+        parsed = int(value)
+    except ValueError as exc:
+        raise argparse.ArgumentTypeError("must be an integer") from exc
+    if parsed < 1:
+        raise argparse.ArgumentTypeError("must be at least 1")
+    return parsed
+
+
 def build_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(
         prog="dehashquery.py",
@@ -654,7 +724,7 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--no-color", action="store_true", help="Disable ANSI colors")
 
     def add_common(p: argparse.ArgumentParser) -> None:
-        p.add_argument("--rate", type=int, default=DEFAULT_RATE,
+        p.add_argument("--rate", type=positive_int, default=DEFAULT_RATE,
                        help=f"Max requests/second (default {DEFAULT_RATE}, API limit 20)")
         p.add_argument("-v", "--verbose", action="store_true", help="Verbose logging")
         p.add_argument("--no-color", action="store_true", help="Disable ANSI colors")
@@ -667,11 +737,17 @@ def build_parser() -> argparse.ArgumentParser:
     grp.add_argument("-d", "--domain", help="Single domain to query")
     grp.add_argument("--domains", help="File with newline-separated domains")
     dump.add_argument("-q", "--query", help="Raw DeHashed query (overrides domain:<domain>)")
-    dump.add_argument("-s", "--size", type=int, default=MAX_SIZE,
+    dump.add_argument("-s", "--size", type=positive_int, default=MAX_SIZE,
                       help=f"Results per page 1-{MAX_SIZE} (default {MAX_SIZE})")
     dump.add_argument("--no-dedupe", action="store_true",
                       help="Keep raw entries; skip client-side de-duplication")
-    dump.add_argument("-o", "--output-dir", default="output", help="Base output directory")
+    dump.add_argument("-o", "--output-dir", default=DEFAULT_OUTPUT_DIR,
+                      help=f"Base output directory (default {DEFAULT_OUTPUT_DIR})")
+    budget = dump.add_mutually_exclusive_group()
+    budget.add_argument("--max-queries", type=positive_int, default=DEFAULT_MAX_QUERIES,
+                        help=f"Max billed search requests (default {DEFAULT_MAX_QUERIES})")
+    budget.add_argument("--infinite", action="store_true",
+                        help="Disable the local query cap (API limits still apply)")
     dump.add_argument("--full", action="store_true",
                       help="Add breach metadata columns to the CSV (free data-wells feed)")
     dump.add_argument("--refresh", action="store_true", help="Ignore cache and re-query")

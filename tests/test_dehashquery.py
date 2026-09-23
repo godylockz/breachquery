@@ -85,5 +85,70 @@ class CacheTests(unittest.TestCase):
                 dehashquery.load_cached_data(cache)
 
 
+class QueryBudgetTests(unittest.TestCase):
+    def test_budget_enforces_limit(self) -> None:
+        budget = dehashquery.QueryBudget(2)
+        budget.consume()
+        budget.consume()
+        self.assertEqual(budget.remaining, 0)
+        self.assertEqual(budget.summary(), "2/2")
+        with self.assertRaises(dehashquery.QueryLimitReached):
+            budget.consume()
+
+    def test_infinite_budget_has_no_local_limit(self) -> None:
+        budget = dehashquery.QueryBudget(None)
+        for _ in range(500):
+            budget.consume()
+        self.assertIsNone(budget.remaining)
+        self.assertEqual(budget.summary(), "500/unlimited")
+
+    def test_fetch_all_entries_stops_at_query_limit(self) -> None:
+        class FakeClient:
+            def __init__(self) -> None:
+                self.query_budget = dehashquery.QueryBudget(2)
+                self.pages = []
+
+            def search(self, _query: str, page: int, size: int):
+                self.query_budget.consume()
+                self.pages.append((page, size))
+                return {
+                    "total": 500,
+                    "entries": [{"email": f"user{page}@example.com"}],
+                }
+
+        client = FakeClient()
+        result = dehashquery.fetch_all_entries(client, "domain:example.com", size=100)
+        self.assertEqual(client.pages, [(1, 100), (2, 100)])
+        self.assertEqual(len(result["entries"]), 2)
+        self.assertEqual(client.query_budget.used, 2)
+
+    def test_dump_parser_defaults_and_infinite_override(self) -> None:
+        parser = dehashquery.build_parser()
+        args = parser.parse_args(["dump", "-d", "example.com"])
+        self.assertEqual(args.output_dir, "output/dehashed")
+        self.assertEqual(args.max_queries, 100)
+        self.assertFalse(args.infinite)
+
+        args = parser.parse_args(["dump", "-d", "example.com", "--infinite"])
+        self.assertTrue(args.infinite)
+
+    @patch("dehashquery.requests.Session")
+    def test_client_blocks_search_before_second_request(self, session_type: Mock) -> None:
+        session = session_type.return_value
+        response = Mock(status_code=200)
+        response.json.return_value = {"total": 0, "entries": []}
+        session.request.return_value = response
+        client = dehashquery.DehashedClient("api-key", query_limit=1)
+
+        client.search("domain:example.com", page=1, size=100)
+        with self.assertRaises(dehashquery.QueryLimitReached):
+            client.search("domain:example.com", page=2, size=100)
+
+        session.request.assert_called_once()
+        for mount_call in session.mount.call_args_list:
+            retry = mount_call.args[1].max_retries
+            self.assertEqual(retry.allowed_methods, frozenset({"GET"}))
+
+
 if __name__ == "__main__":
     unittest.main()

@@ -20,6 +20,8 @@ for one or more domains, with optional breach-metadata enrichment.
 - **Credit-safe** — checks search access and credit balance *before* querying, and
   prompts for confirmation (skippable with `-y`). Cached results are reused so you
   never pay twice for the same domain.
+- **Per-run query budget** — defaults to at most 100 billed search requests across
+  all domains; change it with `--max-queries` or remove the local cap with `--infinite`.
 - **Secret-safe key handling** — the key is read from `.env` or an environment
   variable, never required on the command line.
 - **Multi-domain** — pass a single `--domain` or a `--domains` file.
@@ -65,7 +67,9 @@ Key `dump` options:
 | `--domains` | File with newline-separated domains |
 | `-q, --query` | Raw DeHashed query (overrides `domain:<domain>`) |
 | `-s, --size` | Results per page, 1–10000 (default 10000) |
-| `-o, --output-dir` | Base output directory (default `output/`) |
+| `-o, --output-dir` | Base output directory (default `output/dehashed/`) |
+| `--max-queries` | Maximum billed search requests for the run (default 100) |
+| `--infinite` | Remove the local query cap; DeHashed limits and credit balance still apply |
 | `--full` | Add breach-metadata columns to the CSV (free) |
 | `--refresh` | Ignore cached results and re-query |
 | `-y, --yes` | Skip the credit-confirmation prompt |
@@ -87,7 +91,7 @@ python3 dehashquery.py credits
 
 ## Output
 
-Written to `output/<domain>/`:
+Written to `output/dehashed/<domain>/`:
 
 | File | Contents |
 | --- | --- |
@@ -104,6 +108,8 @@ All generated output and `.env` are git-ignored.
 ## Notes & limits
 
 - 1 search = 1 credit. Cached domains are not re-queried unless you pass `--refresh`.
+- The 100-query default is a local safety budget, not an allocation of credits.
+  `--infinite` disables only this local budget.
 - The API returns at most 50,000 results per query; larger result sets are truncated
   (a warning is printed).
 - WHOIS and monitoring endpoints exist in the v2 API but are out of scope for this tool.
@@ -127,6 +133,9 @@ DeHashed tool, but limited to a recent window (default: the last 90 days).
   the estimated page count before spending on record pages (skip with `-y`).
 - **Hard page cap.** `--max-pages` bounds retrieval per domain (default 10 pages,
   50 rows/page). Larger result sets are truncated to the most recent rows.
+- **Per-run query budget.** At most 300 research count/page requests are made by
+  default across all domains. Use `--max-queries` to change the cap or `--infinite`
+  to remove it.
 - **Recent window only.** Defaults to the last 90 days (`--days`); results are
   ordered newest-first so a page cap keeps the most recent exposures.
 - **Rate-limit safe.** Requests are throttled below HackNotice's documented
@@ -134,7 +143,9 @@ DeHashed tool, but limited to a recent window (default: the last 90 days).
 - **Cached.** A domain is not re-queried unless you pass `--refresh`.
 
 > **Billing:** HackNotice does not publish per-request billing for count and page
-> queries. Confirm how they are metered on your contract before raising the caps.
+> queries. The local budget conservatively counts each research count or page
+> request as one unit. Confirm how they are metered on your contract before raising
+> the cap.
 
 ## Testing access without spending credits
 
@@ -177,6 +188,9 @@ python3 hacknoticequery.py dump -d example.com
 
 # Wider window, higher cap, no prompt
 python3 hacknoticequery.py dump -d example.com --days 30 --max-pages 20 -y
+
+# Remove the local 300-query budget (service limits still apply)
+python3 hacknoticequery.py dump -d example.com --infinite
 ```
 
 Key `dump` options:
@@ -188,6 +202,8 @@ Key `dump` options:
 | `--days` | Look-back window in days (default 90) |
 | `--searchtype` | Phrase match: `wildcard_pre` (default), `wildcard_both`, `wildcard_post`, `match_phrase` |
 | `--max-pages` | Max pages fetched per domain (default 10, 50 rows/page) |
+| `--max-queries` | Max research count/page requests for the run (default 300) |
+| `--infinite` | Remove the local query cap; HackNotice limits still apply |
 | `--min-interval` | Min seconds between requests (default 1.1) |
 | `-o, --output-dir` | Base output directory (default `output/hacknotice/`) |
 | `--refresh` | Ignore cache and re-query |

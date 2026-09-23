@@ -56,6 +56,8 @@ class ClientTests(unittest.TestCase):
             f"{hacknoticequery.API_BASE_URL}{hacknoticequery.VERIFY_PATH}",
             timeout=hacknoticequery.REQUEST_TIMEOUT,
         )
+        retry = session.mount.call_args.args[1].max_retries
+        self.assertEqual(retry.allowed_methods, frozenset({"GET"}))
 
     @patch("hacknoticequery.time.sleep")
     @patch("hacknoticequery.requests.Session")
@@ -121,16 +123,34 @@ class QueryTests(unittest.TestCase):
     def test_default_output_is_provider_specific(self) -> None:
         args = hacknoticequery.build_parser().parse_args(["dump", "-d", "example.com"])
         self.assertEqual(args.output_dir, "output/hacknotice")
+        self.assertEqual(args.max_queries, 300)
+        self.assertFalse(args.infinite)
 
     def test_parser_rejects_non_positive_limits(self) -> None:
         parser = hacknoticequery.build_parser()
         for argv in (
             ["dump", "-d", "example.com", "--days", "0"],
             ["dump", "-d", "example.com", "--max-pages", "-1"],
+            ["dump", "-d", "example.com", "--max-queries", "0"],
             ["verify", "--min-interval", "0.5"],
         ):
             with self.subTest(argv=argv), redirect_stderr(io.StringIO()), self.assertRaises(SystemExit):
                 parser.parse_args(argv)
+
+    def test_client_enforces_research_query_limit(self) -> None:
+        client = object.__new__(hacknoticequery.HackNoticeClient)
+        client.query_budget = hacknoticequery.QueryBudget(1)
+        client._request = Mock(return_value={"count": 10})
+        self.assertEqual(client.count_term({}), 10)
+        with self.assertRaisesRegex(RuntimeError, "Local query limit"):
+            client.search_term({}, 0)
+        client._request.assert_called_once()
+
+    def test_infinite_override_is_parsed(self) -> None:
+        args = hacknoticequery.build_parser().parse_args(
+            ["dump", "-d", "example.com", "--infinite"]
+        )
+        self.assertTrue(args.infinite)
 
 
 class CacheTests(unittest.TestCase):
@@ -192,6 +212,55 @@ class CacheTests(unittest.TestCase):
             processor_type.return_value.process.assert_called_once_with(
                 [{"email": "user@example.com"}]
             )
+
+    @patch("hacknoticequery.resolve_credentials", return_value={"integration_key": "key"})
+    @patch("hacknoticequery.DumpProcessor")
+    @patch("hacknoticequery.HackNoticeClient")
+    def test_dump_caps_count_and_pages_at_query_limit(
+        self, client_type: Mock, processor_type: Mock, _resolve: Mock
+    ) -> None:
+        client = client_type.return_value
+        client.query_budget = hacknoticequery.QueryBudget(2)
+        client.requests_made = 2
+
+        def count_term(_body):
+            client.query_budget.consume()
+            return 500
+
+        def search_term(_body, _page):
+            client.query_budget.consume()
+            return [{"email": "user@example.com"}]
+
+        client.count_term.side_effect = count_term
+        client.search_term.side_effect = search_term
+
+        with tempfile.TemporaryDirectory() as directory:
+            args = hacknoticequery.build_parser().parse_args(
+                [
+                    "dump", "-d", "example.com", "--output-dir", directory,
+                    "--max-queries", "2", "--max-pages", "10", "-y",
+                ]
+            )
+            with redirect_stdout(io.StringIO()):
+                self.assertEqual(hacknoticequery.cmd_dump(args), 0)
+
+        client_type.assert_called_once_with(
+            {"integration_key": "key"}, min_interval=1.1, query_limit=2
+        )
+        client.count_term.assert_called_once()
+        client.search_term.assert_called_once()
+        self.assertEqual(client.query_budget.used, 2)
+        processor_type.return_value.process.assert_called_once_with(
+            [{
+                "email": "user@example.com",
+                "username": "",
+                "password": "",
+                "hashed_password": "",
+                "ip_address": "",
+                "url": "",
+                "database_name": "",
+            }]
+        )
 
 
 if __name__ == "__main__":

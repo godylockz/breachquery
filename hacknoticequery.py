@@ -13,6 +13,7 @@ Conservative by design:
   * A count query runs first; you confirm the estimated page count before any
     record pages are fetched (skip with -y).
   * --max-pages hard-caps retrieval per domain (default 10 pages, ~500 rows).
+  * --max-queries caps research count/page requests per run (default 300).
   * Requests are throttled below HackNotice's documented 1 req/s governor.
   * Results are cached; a domain is not re-queried unless you pass --refresh.
 
@@ -36,7 +37,13 @@ import os
 import sys
 import time
 
-from dehashquery import Colors, DumpProcessor, load_domains, parse_env_file
+from dehashquery import (
+    Colors,
+    DumpProcessor,
+    QueryBudget,
+    load_domains,
+    parse_env_file,
+)
 
 try:
     import requests
@@ -57,6 +64,7 @@ SEARCH_TERM_PATH = "/research8/search/term/page/{page}"   # page is zero-based
 PAGE_SIZE = 50            # rows per research page (fixed server-side)
 DEFAULT_DAYS = 90
 DEFAULT_MAX_PAGES = 10
+DEFAULT_MAX_QUERIES = 300
 DEFAULT_OUTPUT_DIR = "output/hacknotice"
 MIN_INTERVAL = 1.1        # seconds between requests (governor: 1 req/s)
 REQUEST_TIMEOUT = 60
@@ -149,10 +157,12 @@ def extract_items(response: Any) -> List[Dict[str, Any]]:
 class HackNoticeClient:
     """Thin wrapper over the HackNotice extension API, throttled to <1 req/s."""
 
-    def __init__(self, creds: Dict[str, str], min_interval: float = MIN_INTERVAL) -> None:
+    def __init__(self, creds: Dict[str, str], min_interval: float = MIN_INTERVAL,
+                 query_limit: Optional[int] = None) -> None:
         self.min_interval = max(1.0, min_interval)
         self._last_call = 0.0
         self.requests_made = 0
+        self.query_budget = QueryBudget(query_limit)
         self._signed_in = False
         self.session = requests.Session()
         self.session.headers.update({
@@ -164,7 +174,8 @@ class HackNoticeClient:
         retry = Retry(
             total=3, connect=3, read=2, backoff_factor=2.0,
             status_forcelist=(500, 502, 503, 504),
-            allowed_methods=frozenset({"GET", "POST"}),
+            # Research POSTs may be metered, so never retry them invisibly.
+            allowed_methods=frozenset({"GET"}),
             raise_on_status=False,
         )
         self.session.mount("https://", HTTPAdapter(max_retries=retry))
@@ -229,12 +240,14 @@ class HackNoticeClient:
         self._signed_in = False
 
     def count_term(self, body: Dict[str, Any]) -> int:
+        self.query_budget.consume()
         count = extract_count(self._request("POST", COUNT_TERM_PATH, json=body))
         if count is None:
             raise RuntimeError("Count response did not include a numeric count.")
         return count
 
     def search_term(self, body: Dict[str, Any], page: int) -> List[Dict[str, Any]]:
+        self.query_budget.consume()
         return extract_items(self._request("POST", SEARCH_TERM_PATH.format(page=page), json=body))
 
     def verify(self) -> Any:
@@ -342,7 +355,7 @@ def confirm_pages(domain: str, count: int, pages: int, assume_yes: bool) -> bool
     if count == 0:
         return False
     if est_pages > pages:
-        print(f"{Colors.YELLOW}[!] Result set exceeds --max-pages ({pages}); "
+        print(f"{Colors.YELLOW}[!] Result set exceeds the current page/query cap ({pages}); "
               f"output will be truncated to the {pages * PAGE_SIZE} most recent rows."
               f"{Colors.NOCOLOR}")
     if assume_yes:
@@ -418,9 +431,18 @@ def cmd_count(args: argparse.Namespace) -> int:
     if not domains:
         raise SystemExit(f"{Colors.RED}[-] No valid domains supplied.{Colors.NOCOLOR}")
     creds = resolve_credentials()
-    client = HackNoticeClient(creds, min_interval=args.min_interval)
+    query_limit = None if args.infinite else args.max_queries
+    client = HackNoticeClient(
+        creds,
+        min_interval=args.min_interval,
+        query_limit=query_limit,
+    )
     try:
         for domain in domains:
+            if client.query_budget.remaining == 0:
+                print(f"{Colors.YELLOW}[!] Local query limit reached; stopping."
+                      f"{Colors.NOCOLOR}")
+                break
             count = client.count_term(build_body(domain, args))
             est_pages = (count + PAGE_SIZE - 1) // PAGE_SIZE if count else 0
             print(f"{Colors.CYAN}[*] {domain}: {count} credential hit(s) in the last "
@@ -428,6 +450,8 @@ def cmd_count(args: argparse.Namespace) -> int:
     finally:
         client.sign_out()
     print(f"{Colors.CYAN}[*] Requests used: {client.requests_made}{Colors.NOCOLOR}")
+    print(f"{Colors.CYAN}[*] Research queries used: "
+          f"{client.query_budget.summary()}{Colors.NOCOLOR}")
     return 0
 
 
@@ -442,7 +466,12 @@ def cmd_dump(args: argparse.Namespace) -> int:
     )
     client = None
     if need_query:
-        client = HackNoticeClient(resolve_credentials(), min_interval=args.min_interval)
+        query_limit = None if args.infinite else args.max_queries
+        client = HackNoticeClient(
+            resolve_credentials(),
+            min_interval=args.min_interval,
+            query_limit=query_limit,
+        )
     try:
         for domain in domains:
             out_dir = base_dir / domain
@@ -456,11 +485,27 @@ def cmd_dump(args: argparse.Namespace) -> int:
             else:
                 if client is None:
                     raise RuntimeError("HackNotice client was not initialized for a new query.")
+                if client.query_budget.remaining == 0:
+                    print(
+                        f"{Colors.YELLOW}[!] Local query limit reached; skipping "
+                        f"uncached target {domain}.{Colors.NOCOLOR}"
+                    )
+                    continue
                 body = build_body(domain, args)
                 count = client.count_term(body)
-                if not confirm_pages(domain, count, args.max_pages, args.yes):
+                pages = args.max_pages
+                remaining = client.query_budget.remaining
+                if remaining is not None:
+                    pages = min(pages, remaining)
+                if count and pages == 0:
+                    print(
+                        f"{Colors.YELLOW}[!] Query limit reached after counting {domain}; "
+                        f"no result pages were fetched.{Colors.NOCOLOR}"
+                    )
                     continue
-                entries = fetch_entries(client, body, args.max_pages)
+                if not confirm_pages(domain, count, pages, args.yes):
+                    continue
+                entries = fetch_entries(client, body, pages)
                 out_dir.mkdir(parents=True, exist_ok=True)
                 cache.write_text(json.dumps(
                     {"source": CACHE_SOURCE, "domain": domain,
@@ -474,6 +519,8 @@ def cmd_dump(args: argparse.Namespace) -> int:
         if client is not None:
             client.sign_out()
             print(f"{Colors.CYAN}[*] Requests used: {client.requests_made}{Colors.NOCOLOR}")
+            print(f"{Colors.CYAN}[*] Research queries used: "
+                  f"{client.query_budget.summary()}{Colors.NOCOLOR}")
 
     print(f"{Colors.GREEN}[*] Done{Colors.NOCOLOR}")
     return 0
@@ -524,6 +571,11 @@ def build_parser() -> argparse.ArgumentParser:
                        help=f"Look-back window in days (default {DEFAULT_DAYS})")
         p.add_argument("--searchtype", choices=SEARCH_TYPES, default="wildcard_pre",
                        help="Phrase match mode (default wildcard_pre: emails ending in the term)")
+        budget = p.add_mutually_exclusive_group()
+        budget.add_argument("--max-queries", type=positive_int, default=DEFAULT_MAX_QUERIES,
+                            help=f"Max research count/page requests (default {DEFAULT_MAX_QUERIES})")
+        budget.add_argument("--infinite", action="store_true",
+                            help="Disable the per-run query budget (--max-pages still applies)")
         add_auth(p)
 
     sub = parser.add_subparsers(dest="command")
