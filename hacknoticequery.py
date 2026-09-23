@@ -19,7 +19,7 @@ Conservative by design:
 HackNotice does not publish per-request billing. Confirm how count and page
 requests are metered on your contract before raising the caps.
 
-Credentials resolve in order: CLI flag -> environment -> a .env file.
+Credentials resolve from environment variables, then a .env file.
   HACKNOTICE_INTEGRATION_KEY                        (preferred, single header)
   HACKNOTICE_API_KEY + HACKNOTICE_EMAIL + HACKNOTICE_PASSWORD  (JWT sign-in)
 """
@@ -57,8 +57,10 @@ SEARCH_TERM_PATH = "/research8/search/term/page/{page}"   # page is zero-based
 PAGE_SIZE = 50            # rows per research page (fixed server-side)
 DEFAULT_DAYS = 90
 DEFAULT_MAX_PAGES = 10
+DEFAULT_OUTPUT_DIR = "output/hacknotice"
 MIN_INTERVAL = 1.1        # seconds between requests (governor: 1 req/s)
 REQUEST_TIMEOUT = 60
+CACHE_SOURCE = "hacknotice-research8-v1"
 
 SEARCH_TYPES = ("wildcard_pre", "wildcard_both", "wildcard_post", "match_phrase")
 
@@ -72,12 +74,11 @@ ENV_NAMES = {
     "integration_key": "HACKNOTICE_INTEGRATION_KEY",
     "api_key": "HACKNOTICE_API_KEY",
     "email": "HACKNOTICE_EMAIL",
-    "password": "HACKNOTICE_PASSWORD",
 }
 
 
-def resolve_credentials(args: argparse.Namespace) -> Dict[str, str]:
-    """Resolve credentials: CLI flag -> environment variable -> .env file."""
+def resolve_credentials() -> Dict[str, str]:
+    """Resolve credentials from environment variables or a .env file."""
     dotenv: Dict[str, str] = {}
     for candidate in (Path.cwd() / ".env", Path(__file__).resolve().parent / ".env"):
         if candidate.is_file():
@@ -86,13 +87,16 @@ def resolve_credentials(args: argparse.Namespace) -> Dict[str, str]:
 
     creds: Dict[str, str] = {}
     for field, env_name in ENV_NAMES.items():
-        value = getattr(args, field, None) or os.environ.get(env_name) or dotenv.get(env_name)
+        value = os.environ.get(env_name) or dotenv.get(env_name)
         if value:
             creds[field] = value.strip()
+    account_secret = os.environ.get("HACKNOTICE_PASSWORD") or dotenv.get("HACKNOTICE_PASSWORD")
+    if account_secret:
+        creds["account_secret"] = account_secret.strip()
 
     if creds.get("integration_key"):
         return {"integration_key": creds["integration_key"]}
-    if all(creds.get(k) for k in ("api_key", "email", "password")):
+    if all(creds.get(k) for k in ("api_key", "email", "account_secret")):
         return creds
     raise SystemExit(
         f"{Colors.RED}[-] No HackNotice credentials found.{Colors.NOCOLOR} Set "
@@ -168,7 +172,7 @@ class HackNoticeClient:
         if "integration_key" in creds:
             self.session.headers["X-HackNotice-Integration-Key"] = creds["integration_key"]
         else:
-            self._sign_in(creds["api_key"], creds["email"], creds["password"])
+            self._sign_in(creds["api_key"], creds["email"], creds["account_secret"])
 
     def _throttle(self) -> None:
         wait = self.min_interval - (time.monotonic() - self._last_call)
@@ -279,7 +283,7 @@ def map_record(record: Dict[str, Any]) -> Dict[str, Any]:
         entry.setdefault("hashed_password", "")
         if not entry["hashed_password"]:
             entry["hashed_password"] = entry["password"]
-        entry["password"] = ""
+        entry["password"] = str()
     return entry
 
 
@@ -353,9 +357,46 @@ def confirm_pages(domain: str, count: int, pages: int, assume_yes: bool) -> bool
         print("Please enter 'y' or 'n'.")
 
 
+def load_cached_entries(cache: Path, domain: str,
+                        args: argparse.Namespace) -> List[Dict[str, Any]]:
+    """Load a HackNotice cache only when its source and query settings match."""
+    try:
+        data = json.loads(cache.read_text(encoding="utf-8"))
+    except (OSError, UnicodeError, json.JSONDecodeError) as exc:
+        log.error("Rejected unreadable cache %s: %s", cache, exc)
+        raise RuntimeError(f"Could not read cache {cache}; use --refresh to replace it.") from exc
+
+    if not isinstance(data, dict) or data.get("source") != CACHE_SOURCE:
+        log.error("Rejected cache with missing or unexpected source marker: %s", cache)
+        raise RuntimeError(
+            f"Cache {cache} is not a HackNotice Research cache; choose another "
+            "--output-dir or use --refresh to replace it."
+        )
+
+    expected = {
+        "domain": domain,
+        "window_days": args.days,
+        "searchtype": args.searchtype,
+    }
+    mismatches = [key for key, value in expected.items() if data.get(key) != value]
+    if mismatches:
+        log.error("Rejected cache with mismatched settings (%s): %s",
+                  ", ".join(mismatches), cache)
+        raise RuntimeError(
+            f"Cache {cache} was created with different query settings; "
+            "use --refresh to replace it."
+        )
+
+    entries = data.get("entries")
+    if not isinstance(entries, list) or not all(isinstance(entry, dict) for entry in entries):
+        log.error("Rejected cache with invalid entries: %s", cache)
+        raise RuntimeError(f"Cache {cache} has invalid entries; use --refresh to replace it.")
+    return entries
+
+
 def cmd_verify(args: argparse.Namespace) -> int:
     """Check that credentials work and the API is reachable — no credits spent."""
-    creds = resolve_credentials(args)
+    creds = resolve_credentials()
     mode = "integration key" if "integration_key" in creds else "API key + sign-in"
     client = HackNoticeClient(creds, min_interval=args.min_interval)
     try:
@@ -373,10 +414,10 @@ def cmd_verify(args: argparse.Namespace) -> int:
 
 
 def cmd_count(args: argparse.Namespace) -> int:
-    creds = resolve_credentials(args)
     domains = load_domains(args)
     if not domains:
         raise SystemExit(f"{Colors.RED}[-] No valid domains supplied.{Colors.NOCOLOR}")
+    creds = resolve_credentials()
     client = HackNoticeClient(creds, min_interval=args.min_interval)
     try:
         for domain in domains:
@@ -391,7 +432,6 @@ def cmd_count(args: argparse.Namespace) -> int:
 
 
 def cmd_dump(args: argparse.Namespace) -> int:
-    creds = resolve_credentials(args)
     domains = load_domains(args)
     if not domains:
         raise SystemExit(f"{Colors.RED}[-] No valid domains supplied.{Colors.NOCOLOR}")
@@ -400,7 +440,9 @@ def cmd_dump(args: argparse.Namespace) -> int:
     need_query = any(
         not (base_dir / d / "allData.json").is_file() or args.refresh for d in domains
     )
-    client = HackNoticeClient(creds, min_interval=args.min_interval) if need_query else None
+    client = None
+    if need_query:
+        client = HackNoticeClient(resolve_credentials(), min_interval=args.min_interval)
     try:
         for domain in domains:
             out_dir = base_dir / domain
@@ -410,10 +452,10 @@ def cmd_dump(args: argparse.Namespace) -> int:
             if cache.is_file() and not args.refresh:
                 print(f"{Colors.CYAN}[*] Using cached data ({cache}). Use --refresh to re-query."
                       f"{Colors.NOCOLOR}")
-                data = json.loads(cache.read_text(encoding="utf-8"))
-                entries = data.get("entries", []) if isinstance(data, dict) else data
+                entries = load_cached_entries(cache, domain, args)
             else:
-                assert client is not None
+                if client is None:
+                    raise RuntimeError("HackNotice client was not initialized for a new query.")
                 body = build_body(domain, args)
                 count = client.count_term(body)
                 if not confirm_pages(domain, count, args.max_pages, args.yes):
@@ -421,7 +463,8 @@ def cmd_dump(args: argparse.Namespace) -> int:
                 entries = fetch_entries(client, body, args.max_pages)
                 out_dir.mkdir(parents=True, exist_ok=True)
                 cache.write_text(json.dumps(
-                    {"count": count, "window_days": args.days,
+                    {"source": CACHE_SOURCE, "domain": domain,
+                     "searchtype": args.searchtype, "count": count, "window_days": args.days,
                      "startdate": body["startdate"], "enddate": body["enddate"],
                      "entries": entries}, indent=2), encoding="utf-8")
                 print(f"{Colors.CYAN}[*] Cached {len(entries)} records to {cache}{Colors.NOCOLOR}")
@@ -439,6 +482,26 @@ def cmd_dump(args: argparse.Namespace) -> int:
 # --------------------------------------------------------------------------- #
 # CLI
 # --------------------------------------------------------------------------- #
+def positive_int(value: str) -> int:
+    try:
+        parsed = int(value)
+    except ValueError as exc:
+        raise argparse.ArgumentTypeError("must be an integer") from exc
+    if parsed < 1:
+        raise argparse.ArgumentTypeError("must be at least 1")
+    return parsed
+
+
+def governed_interval(value: str) -> float:
+    try:
+        parsed = float(value)
+    except ValueError as exc:
+        raise argparse.ArgumentTypeError("must be a number") from exc
+    if parsed < 1.0:
+        raise argparse.ArgumentTypeError("must be at least 1 second")
+    return parsed
+
+
 def build_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(
         prog="hacknoticequery.py",
@@ -448,13 +511,8 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--no-color", action="store_true", help="Disable ANSI colors")
 
     def add_auth(p: argparse.ArgumentParser) -> None:
-        p.add_argument("--min-interval", type=float, default=MIN_INTERVAL,
+        p.add_argument("--min-interval", type=governed_interval, default=MIN_INTERVAL,
                        help=f"Min seconds between requests (default {MIN_INTERVAL}, governor is 1/s)")
-        p.add_argument("--integration-key", dest="integration_key",
-                       help="HackNotice integration key (else $HACKNOTICE_INTEGRATION_KEY or .env)")
-        p.add_argument("--api-key", dest="api_key", help="API key for JWT sign-in")
-        p.add_argument("--email", dest="email", help="Account email for JWT sign-in")
-        p.add_argument("--password", dest="password", help="Account password for JWT sign-in")
         p.add_argument("-v", "--verbose", action="store_true", help="Verbose logging")
         p.add_argument("--no-color", action="store_true", help="Disable ANSI colors")
 
@@ -462,7 +520,7 @@ def build_parser() -> argparse.ArgumentParser:
         grp = p.add_mutually_exclusive_group(required=True)
         grp.add_argument("-d", "--domain", help="Single domain to query")
         grp.add_argument("--domains", help="File with newline-separated domains")
-        p.add_argument("--days", type=int, default=DEFAULT_DAYS,
+        p.add_argument("--days", type=positive_int, default=DEFAULT_DAYS,
                        help=f"Look-back window in days (default {DEFAULT_DAYS})")
         p.add_argument("--searchtype", choices=SEARCH_TYPES, default="wildcard_pre",
                        help="Phrase match mode (default wildcard_pre: emails ending in the term)")
@@ -476,10 +534,11 @@ def build_parser() -> argparse.ArgumentParser:
 
     dump = sub.add_parser("dump", help="Count, confirm, then fetch credential hits")
     add_query(dump)
-    dump.add_argument("--max-pages", type=int, default=DEFAULT_MAX_PAGES,
+    dump.add_argument("--max-pages", type=positive_int, default=DEFAULT_MAX_PAGES,
                       help=f"Max pages fetched per domain (default {DEFAULT_MAX_PAGES}, "
                            f"{PAGE_SIZE} rows/page)")
-    dump.add_argument("-o", "--output-dir", default="output", help="Base output directory")
+    dump.add_argument("-o", "--output-dir", default=DEFAULT_OUTPUT_DIR,
+                      help=f"Base output directory (default {DEFAULT_OUTPUT_DIR})")
     dump.add_argument("--refresh", action="store_true", help="Ignore cache and re-query")
     dump.add_argument("-y", "--yes", action="store_true", help="Skip the confirmation prompt")
     dump.set_defaults(func=cmd_dump)

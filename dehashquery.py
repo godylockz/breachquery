@@ -8,26 +8,29 @@ Subcommands:
   password-check   Free SHA-256 password-appearance lookup (no credits used).
   credits          Show your search / WHOIS credit balances.
 
-The API key is never taken on the command line by default. It is resolved, in
-order, from:  --api-key  ->  $DEHASHED_API_KEY  ->  a .env file
-(DEHASHED_API_KEY=...) in the current directory or next to this script.
+The API key is resolved from $DEHASHED_API_KEY or a .env file
+(DEHASHED_API_KEY=...) in the current directory or next to this script. Secrets
+are not accepted as command-line arguments because those can be exposed in the
+process list and shell history.
 """
 
 from __future__ import annotations
 
-from dataclasses import dataclass, field
 from itertools import product
 from pathlib import Path
 from typing import Any, Dict, Iterable, List, Optional
 import argparse
 import csv
+import getpass
 import hashlib
 import json
 import logging
 import os
+import re
 import sys
 import time
 from collections import deque
+from urllib.parse import urlsplit
 
 try:
     import requests
@@ -42,7 +45,7 @@ except ImportError:  # pragma: no cover - dependency guard
 # Constants
 # --------------------------------------------------------------------------- #
 SEARCH_URL = "https://api.dehashed.com/v2/search"
-SEARCH_PASSWORD_URL = "https://api.dehashed.com/v2/search-password"
+HASH_LOOKUP_URL = "https://api.dehashed.com/v2/search-password"
 USER_INFO_URL = "https://api.dehashed.com/v2/info/user"
 DATA_WELLS_URL = "https://api.dehashed.com/data-wells"
 
@@ -50,6 +53,7 @@ MAX_SIZE = 10_000          # API hard cap for `size`
 MAX_TOTAL = 50_000         # API hard cap for page*size (total results per query)
 DEFAULT_RATE = 15          # client-side requests/second (API limit is 20/s)
 REQUEST_TIMEOUT = 60       # seconds
+DEHASHED_CACHE_SOURCE = "dehashed-v2"
 
 # Entry fields exposed by the current v2 API, in CSV column order.
 ENTRY_FIELDS = [
@@ -102,11 +106,8 @@ def parse_env_file(path: Path) -> Dict[str, str]:
     return values
 
 
-def resolve_api_key(cli_key: Optional[str]) -> str:
-    """Resolve the API key: --api-key -> env var -> .env file."""
-    if cli_key:
-        return cli_key.strip()
-
+def resolve_api_key() -> str:
+    """Resolve the API key from the environment or a .env file."""
     env_key = os.environ.get("DEHASHED_API_KEY")
     if env_key:
         return env_key.strip()
@@ -119,8 +120,8 @@ def resolve_api_key(cli_key: Optional[str]) -> str:
                 return key.strip()
 
     raise SystemExit(
-        f"{Colors.RED}[-] No API key found.{Colors.NOCOLOR} Provide one via --api-key, "
-        "the DEHASHED_API_KEY environment variable, or a .env file "
+        f"{Colors.RED}[-] No API key found.{Colors.NOCOLOR} Set the "
+        "DEHASHED_API_KEY environment variable or use a .env file "
         "(cp .env.example .env and edit it)."
     )
 
@@ -218,7 +219,7 @@ class DehashedClient:
         return self._request("POST", SEARCH_URL, json=payload)
 
     def search_password(self, sha256_hash: str) -> Dict[str, Any]:
-        return self._request("POST", SEARCH_PASSWORD_URL,
+        return self._request("POST", HASH_LOOKUP_URL,
                              json={"sha256_hashed_password": sha256_hash})
 
     def data_wells_page(self, page: int, count: int = 50,
@@ -310,7 +311,12 @@ def fetch_all_entries(client: DehashedClient, query: str, size: int,
         collect(page_entries)
         log.info("  page %d/%d (%d unique entries so far)", page, last_page, len(entries))
 
-    return {"balance": balance, "total": total, "entries": entries}
+    return {
+        "source": DEHASHED_CACHE_SOURCE,
+        "balance": balance,
+        "total": total,
+        "entries": entries,
+    }
 
 
 # --------------------------------------------------------------------------- #
@@ -481,27 +487,99 @@ def preflight(client: DehashedClient, assume_yes: bool) -> None:
 # --------------------------------------------------------------------------- #
 # Subcommand handlers
 # --------------------------------------------------------------------------- #
+_DOMAIN_LABEL = re.compile(r"^[a-z0-9](?:[a-z0-9-]{0,61}[a-z0-9])?$")
+
+
+def normalize_domain(raw: str) -> str:
+    """Return a canonical DNS name, rejecting unsafe or malformed input."""
+    value = raw.strip()
+    if not value:
+        raise ValueError("domain is empty")
+    if any(ord(char) < 32 or ord(char) == 127 for char in value):
+        raise ValueError("domain contains control characters")
+
+    parsed = urlsplit(value if "://" in value else f"//{value}")
+    if parsed.scheme and parsed.scheme.lower() not in ("http", "https"):
+        raise ValueError("only http and https URLs are accepted")
+    if parsed.username is not None or parsed.password is not None:
+        raise ValueError("userinfo is not allowed in a domain")
+    try:
+        host = parsed.hostname
+        parsed.port
+    except ValueError as exc:
+        raise ValueError("domain has an invalid port") from exc
+    if not host or ":" in host:
+        raise ValueError("a DNS hostname is required")
+
+    host = host.rstrip(".").lower()
+    if host.startswith("www."):
+        host = host[4:]
+    try:
+        host = host.encode("idna").decode("ascii")
+    except UnicodeError as exc:
+        raise ValueError("domain is not valid IDNA") from exc
+
+    if len(host) > 253 or not all(_DOMAIN_LABEL.fullmatch(label) for label in host.split(".")):
+        raise ValueError("domain is not a valid DNS hostname")
+    return host
+
+
 def load_domains(args: argparse.Namespace) -> List[str]:
     domains: List[str] = []
-    if args.domains:
-        domains = Path(args.domains).read_text(encoding="utf-8").splitlines()
-    elif args.domain:
-        domains = [args.domain]
-    cleaned = []
-    for d in domains:
-        d = d.strip().lower().removeprefix("http://").removeprefix("https://").removeprefix("www.")
-        d = d.split("/")[0]
-        if d:
-            cleaned.append(d)
+    domain_file = getattr(args, "domains", None)
+    single_domain = getattr(args, "domain", None)
+    if domain_file:
+        try:
+            domains = Path(domain_file).read_text(encoding="utf-8").splitlines()
+        except (OSError, UnicodeError) as exc:
+            raise SystemExit(f"[-] Could not read domain file {domain_file!r}: {exc}") from exc
+    elif single_domain:
+        domains = [single_domain]
+
+    cleaned: List[str] = []
+    for raw in domains:
+        if not raw.strip():
+            continue
+        try:
+            cleaned.append(normalize_domain(raw))
+        except ValueError as exc:
+            log.error("Rejected invalid domain input %r: %s", raw[:200], exc)
+            raise SystemExit(f"[-] Invalid domain {raw!r}: {exc}") from exc
     return list(dict.fromkeys(cleaned))
 
 
+def load_cached_data(cache: Path) -> Any:
+    """Load a DeHashed cache and reject foreign or malformed data."""
+    try:
+        data = json.loads(cache.read_text(encoding="utf-8"))
+    except (OSError, UnicodeError, json.JSONDecodeError) as exc:
+        log.error("Rejected unreadable cache %s: %s", cache, exc)
+        raise RuntimeError(f"Could not read cache {cache}; use --refresh to replace it.") from exc
+
+    if isinstance(data, dict):
+        source = data.get("source")
+        if source not in (None, DEHASHED_CACHE_SOURCE):
+            log.error("Rejected cache with unexpected source marker %r: %s", source, cache)
+            raise RuntimeError(
+                f"Cache {cache} is not a DeHashed cache; choose another "
+                "--output-dir or use --refresh to replace it."
+            )
+        entries = data.get("entries")
+    else:
+        entries = data
+
+    if not isinstance(entries, list) or not all(isinstance(entry, dict) for entry in entries):
+        log.error("Rejected cache with invalid entries: %s", cache)
+        raise RuntimeError(f"Cache {cache} has invalid entries; use --refresh to replace it.")
+    return data
+
+
 def cmd_dump(args: argparse.Namespace) -> int:
-    api_key = resolve_api_key(args.api_key)
     domains = load_domains(args)
     if not domains:
         raise SystemExit(f"{Colors.RED}[-] No valid domains supplied.{Colors.NOCOLOR}")
 
+    api_key = resolve_api_key()
     client = DehashedClient(api_key, rate=args.rate)
     base_dir = Path(args.output_dir)
 
@@ -521,7 +599,7 @@ def cmd_dump(args: argparse.Namespace) -> int:
 
         if cache.is_file() and not args.refresh:
             print(f"{Colors.CYAN}[*] Using cached data ({cache}). Use --refresh to re-query.{Colors.NOCOLOR}")
-            data = json.loads(cache.read_text(encoding="utf-8"))
+            data = load_cached_data(cache)
         else:
             query = args.query or f"domain:{domain}"
             data = fetch_all_entries(client, query, size=args.size,
@@ -541,9 +619,12 @@ def cmd_dump(args: argparse.Namespace) -> int:
 
 
 def cmd_password_check(args: argparse.Namespace) -> int:
-    api_key = resolve_api_key(args.api_key)
+    api_key = resolve_api_key()
     client = DehashedClient(api_key, rate=args.rate)
-    sha256_hash = hashlib.sha256(args.password.encode("utf-8")).hexdigest()
+    password = getpass.getpass("Password to check: ")
+    if not password:
+        raise SystemExit(f"{Colors.RED}[-] Password cannot be empty.{Colors.NOCOLOR}")
+    sha256_hash = hashlib.sha256(password.encode("utf-8")).hexdigest()
     result = client.search_password(sha256_hash)
     found = result.get("results_found", 0)
     color = Colors.RED if found else Colors.GREEN
@@ -552,7 +633,7 @@ def cmd_password_check(args: argparse.Namespace) -> int:
 
 
 def cmd_credits(args: argparse.Namespace) -> int:
-    api_key = resolve_api_key(args.api_key)
+    api_key = resolve_api_key()
     client = DehashedClient(api_key, rate=args.rate)
     info = client.user_info()
     print(f"{Colors.CYAN}[*] Search access : {info.get('search_access')}{Colors.NOCOLOR}")
@@ -573,8 +654,6 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--no-color", action="store_true", help="Disable ANSI colors")
 
     def add_common(p: argparse.ArgumentParser) -> None:
-        p.add_argument("-k", "--api-key", "--apikey", dest="api_key",
-                       help="API key (else $DEHASHED_API_KEY or .env)")
         p.add_argument("--rate", type=int, default=DEFAULT_RATE,
                        help=f"Max requests/second (default {DEFAULT_RATE}, API limit 20)")
         p.add_argument("-v", "--verbose", action="store_true", help="Verbose logging")
@@ -601,7 +680,6 @@ def build_parser() -> argparse.ArgumentParser:
 
     pw = sub.add_parser("password-check", help="Free SHA-256 password appearance lookup")
     add_common(pw)
-    pw.add_argument("password", help="Password to hash and look up (never sent in plaintext)")
     pw.set_defaults(func=cmd_password_check)
 
     cr = sub.add_parser("credits", help="Show credit balances")

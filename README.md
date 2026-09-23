@@ -36,11 +36,10 @@ cp .env.example .env      # then edit .env and paste your API key
 
 ## API key
 
-Resolved in this order:
-
-1. `--api-key <key>` (or `-k`)
-2. `DEHASHED_API_KEY` environment variable
-3. a `.env` file (`DEHASHED_API_KEY=...`) in the current dir or next to the script
+Resolved from the `DEHASHED_API_KEY` environment variable, then a `.env` file
+(`DEHASHED_API_KEY=...`) in the current directory or next to the script. API keys
+are not accepted on the command line, where they can leak through process listings
+or shell history.
 
 `.env` is git-ignored.
 
@@ -74,10 +73,11 @@ Key `dump` options:
 ### Check a password (free, no credits)
 
 ```sh
-python3 dehashquery.py password-check 'Password12345'
+python3 dehashquery.py password-check
 ```
 
-The password is SHA-256 hashed locally and only the hash is sent.
+The password is read from a hidden prompt, SHA-256 hashed locally, and never sent
+in plaintext.
 
 ### Show credit balances
 
@@ -145,7 +145,6 @@ before running any real query:
 
 ```sh
 python3 hacknoticequery.py verify                 # uses .env / environment creds
-python3 hacknoticequery.py verify --integration-key hn_ik_...
 ```
 
 If you use HackNotice's MCP server instead, its `hacknotice_verify_credentials`
@@ -155,12 +154,14 @@ fetching records, but whether *count* queries are metered is not published — t
 
 ## Credentials
 
-Resolved in order — CLI flag → environment variable → `.env` file:
+Resolved from environment variables, then a `.env` file:
 
 1. `HACKNOTICE_INTEGRATION_KEY` (preferred; a single `X-HackNotice-Integration-Key` header), **or**
 2. `HACKNOTICE_API_KEY` + `HACKNOTICE_EMAIL` + `HACKNOTICE_PASSWORD` (JWT sign-in).
 
 `.env` is git-ignored. See `.env.example`.
+Credentials are not accepted on the command line, where they can leak through
+process listings or shell history.
 
 ## Usage
 
@@ -188,13 +189,15 @@ Key `dump` options:
 | `--searchtype` | Phrase match: `wildcard_pre` (default), `wildcard_both`, `wildcard_post`, `match_phrase` |
 | `--max-pages` | Max pages fetched per domain (default 10, 50 rows/page) |
 | `--min-interval` | Min seconds between requests (default 1.1) |
-| `-o, --output-dir` | Base output directory (default `output/`) |
+| `-o, --output-dir` | Base output directory (default `output/hacknotice/`) |
 | `--refresh` | Ignore cache and re-query |
 | `-y, --yes` | Skip the confirmation prompt |
 
 ## Output
 
-Identical layout to `dehashquery.py` (written to `output/<domain>/`): `emails.txt`,
+Identical layout to `dehashquery.py` (written to `output/hacknotice/<domain>/`): `emails.txt`,
 `users.lst`, `passwords.lst`, `emailAndPassword.txt`, `emailAndHash.txt`,
 `outData.csv`, and a cached `allData.json`. HackNotice records are mapped onto the
-same entry schema, so both tools' outputs can be diffed or merged directly.
+same entry schema, so both tools' outputs can be diffed or merged directly. The
+separate default directory prevents either provider from consuming or overwriting
+the other provider's cache and reports.
