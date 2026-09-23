@@ -50,6 +50,7 @@ except ImportError:  # pragma: no cover - dependency guard
 API_BASE_URL = "https://extensionapi.hacknotice.com"
 SIGN_IN_PATH = "/auth/sign_in"
 SIGN_OUT_PATH = "/auth/sign_out"
+VERIFY_PATH = "/auth/verify"   # credential/connectivity check; no search credits
 COUNT_TERM_PATH = "/research8/count/term"
 SEARCH_TERM_PATH = "/research8/search/term/page/{page}"   # page is zero-based
 
@@ -232,6 +233,12 @@ class HackNoticeClient:
     def search_term(self, body: Dict[str, Any], page: int) -> List[Dict[str, Any]]:
         return extract_items(self._request("POST", SEARCH_TERM_PATH.format(page=page), json=body))
 
+    def verify(self) -> Any:
+        """Confirm credentials and connectivity without touching the research
+        surface. Hits /auth/verify (HackNotice's own credential-test endpoint),
+        which does not query breach data and so spends no search credits."""
+        return self._request("POST", VERIFY_PATH)
+
 
 # --------------------------------------------------------------------------- #
 # Query building and record mapping
@@ -346,6 +353,25 @@ def confirm_pages(domain: str, count: int, pages: int, assume_yes: bool) -> bool
         print("Please enter 'y' or 'n'.")
 
 
+def cmd_verify(args: argparse.Namespace) -> int:
+    """Check that credentials work and the API is reachable — no credits spent."""
+    creds = resolve_credentials(args)
+    mode = "integration key" if "integration_key" in creds else "API key + sign-in"
+    client = HackNoticeClient(creds, min_interval=args.min_interval)
+    try:
+        client.verify()
+    except ApiError as exc:
+        print(f"{Colors.RED}[-] Verification failed ({mode}): {exc}{Colors.NOCOLOR}",
+              file=sys.stderr)
+        return 1
+    finally:
+        client.sign_out()
+    print(f"{Colors.GREEN}[*] Credentials valid and API reachable ({mode}). "
+          f"No search credits were spent.{Colors.NOCOLOR}")
+    print(f"{Colors.CYAN}[*] Requests used: {client.requests_made}{Colors.NOCOLOR}")
+    return 0
+
+
 def cmd_count(args: argparse.Namespace) -> int:
     creds = resolve_credentials(args)
     domains = load_domains(args)
@@ -421,14 +447,7 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument("-v", "--verbose", action="store_true", help="Verbose logging")
     parser.add_argument("--no-color", action="store_true", help="Disable ANSI colors")
 
-    def add_common(p: argparse.ArgumentParser) -> None:
-        grp = p.add_mutually_exclusive_group(required=True)
-        grp.add_argument("-d", "--domain", help="Single domain to query")
-        grp.add_argument("--domains", help="File with newline-separated domains")
-        p.add_argument("--days", type=int, default=DEFAULT_DAYS,
-                       help=f"Look-back window in days (default {DEFAULT_DAYS})")
-        p.add_argument("--searchtype", choices=SEARCH_TYPES, default="wildcard_pre",
-                       help="Phrase match mode (default wildcard_pre: emails ending in the term)")
+    def add_auth(p: argparse.ArgumentParser) -> None:
         p.add_argument("--min-interval", type=float, default=MIN_INTERVAL,
                        help=f"Min seconds between requests (default {MIN_INTERVAL}, governor is 1/s)")
         p.add_argument("--integration-key", dest="integration_key",
@@ -439,10 +458,24 @@ def build_parser() -> argparse.ArgumentParser:
         p.add_argument("-v", "--verbose", action="store_true", help="Verbose logging")
         p.add_argument("--no-color", action="store_true", help="Disable ANSI colors")
 
+    def add_query(p: argparse.ArgumentParser) -> None:
+        grp = p.add_mutually_exclusive_group(required=True)
+        grp.add_argument("-d", "--domain", help="Single domain to query")
+        grp.add_argument("--domains", help="File with newline-separated domains")
+        p.add_argument("--days", type=int, default=DEFAULT_DAYS,
+                       help=f"Look-back window in days (default {DEFAULT_DAYS})")
+        p.add_argument("--searchtype", choices=SEARCH_TYPES, default="wildcard_pre",
+                       help="Phrase match mode (default wildcard_pre: emails ending in the term)")
+        add_auth(p)
+
     sub = parser.add_subparsers(dest="command")
 
+    verify = sub.add_parser("verify", help="Check credentials/connectivity (spends no credits)")
+    add_auth(verify)
+    verify.set_defaults(func=cmd_verify)
+
     dump = sub.add_parser("dump", help="Count, confirm, then fetch credential hits")
-    add_common(dump)
+    add_query(dump)
     dump.add_argument("--max-pages", type=int, default=DEFAULT_MAX_PAGES,
                       help=f"Max pages fetched per domain (default {DEFAULT_MAX_PAGES}, "
                            f"{PAGE_SIZE} rows/page)")
@@ -452,7 +485,7 @@ def build_parser() -> argparse.ArgumentParser:
     dump.set_defaults(func=cmd_dump)
 
     cnt = sub.add_parser("count", help="Count-only; fetches no records")
-    add_common(cnt)
+    add_query(cnt)
     cnt.set_defaults(func=cmd_count)
 
     return parser
@@ -461,7 +494,7 @@ def build_parser() -> argparse.ArgumentParser:
 def main(argv: Optional[List[str]] = None) -> int:
     argv = list(sys.argv[1:] if argv is None else argv)
     # Default to the `dump` subcommand when none is given.
-    subcommands = {"dump", "count"}
+    subcommands = {"dump", "count", "verify"}
     if argv and not any(h in argv for h in ("-h", "--help")):
         first_positional = next((a for a in argv if not a.startswith("-")), None)
         if first_positional not in subcommands:

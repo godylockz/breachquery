@@ -136,6 +136,23 @@ DeHashed tool, but limited to a recent window (default: the last 90 days).
 > **Billing:** HackNotice does not publish per-request billing for count and page
 > queries. Confirm how they are metered on your contract before raising the caps.
 
+## Testing access without spending credits
+
+`hacknoticequery.py verify` authenticates and calls HackNotice's own credential-test
+endpoint (`POST /auth/verify`). It never touches the research/search surface, so it
+consumes no search credits — use it to confirm a key, a sign-in, or connectivity
+before running any real query:
+
+```sh
+python3 hacknoticequery.py verify                 # uses .env / environment creds
+python3 hacknoticequery.py verify --integration-key hn_ik_...
+```
+
+If you use HackNotice's MCP server instead, its `hacknotice_verify_credentials`
+tool serves the same purpose. (The `count` subcommand returns totals without
+fetching records, but whether *count* queries are metered is not published — treat
+`verify` as the guaranteed no-cost check.)
+
 ## Credentials
 
 Resolved in order — CLI flag → environment variable → `.env` file:
@@ -148,7 +165,10 @@ Resolved in order — CLI flag → environment variable → `.env` file:
 ## Usage
 
 ```sh
-# Count only — spends the least, fetches no records
+# Verify credentials + connectivity — spends no search credits
+python3 hacknoticequery.py verify
+
+# Count only — fetches no records
 python3 hacknoticequery.py count -d example.com
 
 # Dump last 90 days (count, confirm, then fetch — capped at 10 pages)
