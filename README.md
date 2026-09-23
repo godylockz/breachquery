@@ -107,3 +107,74 @@ All generated output and `.env` are git-ignored.
 - The API returns at most 50,000 results per query; larger result sets are truncated
   (a warning is printed).
 - WHOIS and monitoring endpoints exist in the v2 API but are out of scope for this tool.
+
+---
+
+# HackNotice Research Query Tool
+
+`hacknoticequery.py` is a conservative companion to `dehashquery.py`. It queries
+the [HackNotice](https://hacknotice.com/) Research API (`research8` phrase search)
+for credential exposures on a domain and writes the **same output files** as the
+DeHashed tool, but limited to a recent window (default: the last 90 days).
+
+> **Access:** the HackNotice API is for approved accounts only and requires a
+> prior consultation with HackNotice. This tool cannot get you access — it only
+> uses credentials you already have.
+
+## Conservative by design
+
+- **Count first.** A count query runs before anything is fetched, and you confirm
+  the estimated page count before spending on record pages (skip with `-y`).
+- **Hard page cap.** `--max-pages` bounds retrieval per domain (default 10 pages,
+  50 rows/page). Larger result sets are truncated to the most recent rows.
+- **Recent window only.** Defaults to the last 90 days (`--days`); results are
+  ordered newest-first so a page cap keeps the most recent exposures.
+- **Rate-limit safe.** Requests are throttled below HackNotice's documented
+  1 request/second governor (`--min-interval`).
+- **Cached.** A domain is not re-queried unless you pass `--refresh`.
+
+> **Billing:** HackNotice does not publish per-request billing for count and page
+> queries. Confirm how they are metered on your contract before raising the caps.
+
+## Credentials
+
+Resolved in order — CLI flag → environment variable → `.env` file:
+
+1. `HACKNOTICE_INTEGRATION_KEY` (preferred; a single `X-HackNotice-Integration-Key` header), **or**
+2. `HACKNOTICE_API_KEY` + `HACKNOTICE_EMAIL` + `HACKNOTICE_PASSWORD` (JWT sign-in).
+
+`.env` is git-ignored. See `.env.example`.
+
+## Usage
+
+```sh
+# Count only — spends the least, fetches no records
+python3 hacknoticequery.py count -d example.com
+
+# Dump last 90 days (count, confirm, then fetch — capped at 10 pages)
+python3 hacknoticequery.py dump -d example.com
+
+# Wider window, higher cap, no prompt
+python3 hacknoticequery.py dump -d example.com --days 30 --max-pages 20 -y
+```
+
+Key `dump` options:
+
+| Option | Description |
+| --- | --- |
+| `-d, --domain` | Single domain to query |
+| `--domains` | File with newline-separated domains |
+| `--days` | Look-back window in days (default 90) |
+| `--searchtype` | Phrase match: `wildcard_pre` (default), `wildcard_both`, `wildcard_post`, `match_phrase` |
+| `--max-pages` | Max pages fetched per domain (default 10, 50 rows/page) |
+| `--min-interval` | Min seconds between requests (default 1.1) |
+| `-o, --output-dir` | Base output directory (default `output/`) |
+| `--refresh` | Ignore cache and re-query |
+| `-y, --yes` | Skip the confirmation prompt |
+
+## Output
+
+Identical layout to `dehashquery.py` (written to `output/<domain>/`): `emails.txt`,
+`users.lst`, `passwords.lst`, `emailAndPassword.txt`, `emailAndHash.txt`,
+`outData.csv`, and a cached `allData.json`. HackNotice records are mapped onto the
+same entry schema, so both tools' outputs can be diffed or merged directly.
